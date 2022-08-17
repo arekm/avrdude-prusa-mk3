@@ -504,7 +504,7 @@ static int stk500_initialize(PROGRAMMER * pgm, AVRPART * p)
   }
   else {
     buf[9]  = 0xff;
-    buf[10]  = 0xff;
+    buf[10] = 0xff;
     buf[13] = 0;
     buf[14] = 0;
     buf[17] = 0;
@@ -669,11 +669,15 @@ static int stk500_open(PROGRAMMER * pgm, char * port)
 
   // MIB510 init
   if (strcmp(ldata(lfirst(pgm->id)), "mib510") == 0 &&
-      mib510_isp(pgm, 1) != 0)
+      mib510_isp(pgm, 1) != 0) {
+    serial_close(&pgm->fd);
     return -1;
+  }
 
-  if (stk500_getsync(pgm) < 0)
+  if (stk500_getsync(pgm) < 0) {
+    serial_close(&pgm->fd);
     return -1;
+  }
 
   return 0;
 }
@@ -716,11 +720,14 @@ static int stk500_loadaddr(PROGRAMMER * pgm, AVRMEM * mem, unsigned int addr)
   }
 
   buf[0] = Cmnd_STK_LOAD_ADDRESS;
-  buf[1] = addr & 0xff;
-  buf[2] = (addr >> 8) & 0xff;
-  buf[3] = Sync_CRC_EOP;
-
-  stk500_send(pgm, buf, 4);
+  // Workaround for the infamous ';' bug in the Prusa3D usb to serial converter.
+  // Send the binary data by nibbles to avoid transmitting the ';' character.
+  buf[1] = addr & 0x0f;
+  buf[2] = addr & 0xf0;
+  buf[3] = (addr >> 8) & 0x0f;
+  buf[4] = (addr >> 8) & 0xf0;
+  buf[5] = Sync_CRC_EOP;
+  stk500_send(pgm, buf, 6);
 
   if (stk500_recv(pgm, buf, 1) < 0)
     return -1;
@@ -759,13 +766,15 @@ static int stk500_paged_write(PROGRAMMER * pgm, AVRPART * p, AVRMEM * m,
                               unsigned int page_size,
                               unsigned int addr, unsigned int n_bytes)
 {
-  unsigned char buf[page_size + 16];
+  unsigned char *buf = alloca(page_size + 16);
   int memtype;
   int a_div;
   int block_size;
   int tries;
   unsigned int n;
-  unsigned int i;
+  unsigned int i, j;
+  unsigned int prusa3d_semicolon_workaround_round = 0;
+  bool has_semicolon = false;
 
   if (strcmp(m->desc, "flash") == 0) {
     memtype = 'F';
@@ -806,44 +815,64 @@ static int stk500_paged_write(PROGRAMMER * pgm, AVRPART * p, AVRMEM * m,
     tries++;
     stk500_loadaddr(pgm, m, addr/a_div);
 
-    /* build command block and avoid multiple send commands as it leads to a crash
-        of the silabs usb serial driver on mac os x */
-    i = 0;
-    buf[i++] = Cmnd_STK_PROG_PAGE;
-    buf[i++] = (block_size >> 8) & 0xff;
-    buf[i++] = block_size & 0xff;
-    buf[i++] = memtype;
-    memcpy(&buf[i], &m->buf[addr], block_size);
-    i += block_size;
-    buf[i++] = Sync_CRC_EOP;
-    stk500_send( pgm, buf, i);
-
-    if (stk500_recv(pgm, buf, 1) < 0)
-      return -1;
-    if (buf[0] == Resp_STK_NOSYNC) {
-      if (tries > 33) {
-        avrdude_message(MSG_INFO, "\n%s: stk500_paged_write(): can't get into sync\n",
-                progname);
-        return -3;
+    for (i = 0; i < n_bytes; ++ i)
+      if (m->buf[addr + i] == ';') {
+        has_semicolon = true;
+        break;
       }
-      if (stk500_getsync(pgm) < 0)
-	return -1;
-      goto retry;
-    }
-    else if (buf[0] != Resp_STK_INSYNC) {
-      avrdude_message(MSG_INFO, "\n%s: stk500_paged_write(): (a) protocol error, "
-                      "expect=0x%02x, resp=0x%02x\n",
-                      progname, Resp_STK_INSYNC, buf[0]);
-      return -4;
-    }
-    
-    if (stk500_recv(pgm, buf, 1) < 0)
-      return -1;
-    if (buf[0] != Resp_STK_OK) {
-      avrdude_message(MSG_INFO, "\n%s: stk500_paged_write(): (a) protocol error, "
-                      "expect=0x%02x, resp=0x%02x\n",
-                      progname, Resp_STK_INSYNC, buf[0]);
-      return -5;
+
+    for (prusa3d_semicolon_workaround_round = 0; prusa3d_semicolon_workaround_round < (has_semicolon ? 2u : 1u); prusa3d_semicolon_workaround_round++) {
+      /* build command block and avoid multiple send commands as it leads to a crash
+          of the silabs usb serial driver on mac os x */
+      i = 0;
+      buf[i++] = Cmnd_STK_PROG_PAGE;
+      // Workaround for the infamous ';' bug in the Prusa3D usb to serial converter.
+      // Send the binary data by nibbles to avoid transmitting the ';' character.
+      buf[i++] = (block_size >> 8) & 0xf0;
+      buf[i++] = (block_size >> 8) & 0x0f;
+      buf[i++] = block_size & 0xf0;
+      buf[i++] = block_size & 0x0f;
+      buf[i++] = memtype;
+      if (has_semicolon) {
+        for (j = 0; j < (unsigned)block_size; ++i, ++ j) {
+          buf[i] = m->buf[addr + j];
+          if (buf[i] == ';')
+            buf[i] |= (prusa3d_semicolon_workaround_round ? 0xf0 : 0x0f);
+        }
+      } else {
+        memcpy(&buf[i], &m->buf[addr], block_size);
+        i += block_size;
+      }
+      buf[i++] = Sync_CRC_EOP;
+      stk500_send( pgm, buf, i);
+
+      if (stk500_recv(pgm, buf, 1) < 0)
+        return -1;
+      if (buf[0] == Resp_STK_NOSYNC) {
+        if (tries > 33) {
+          avrdude_message(MSG_INFO, "\n%s: stk500_paged_write(): can't get into sync\n",
+                  progname);
+          return -3;
+        }
+        if (stk500_getsync(pgm) < 0)
+          return -1;
+        goto retry;
+      }
+      else if (buf[0] != Resp_STK_INSYNC) {
+        avrdude_message(MSG_INFO, "\n%s: stk500_paged_write(): (a) protocol error, "
+                        "expect=0x%02x, resp=0x%02x\n",
+                        progname, Resp_STK_INSYNC, buf[0]);
+        return -4;
+      }
+      
+      if (stk500_recv(pgm, buf, 1) < 0)
+        return -1;
+      if (buf[0] != Resp_STK_OK) {
+        avrdude_message(MSG_INFO, "\n%s: stk500_paged_write(): (a) protocol error, "
+                        "expect=0x%02x, resp=0x%02x\n",
+                        progname, Resp_STK_INSYNC, buf[0]);
+        return -5;
+      }
     }
   }
 
@@ -893,11 +922,15 @@ static int stk500_paged_load(PROGRAMMER * pgm, AVRPART * p, AVRMEM * m,
     tries++;
     stk500_loadaddr(pgm, m, addr/a_div);
     buf[0] = Cmnd_STK_READ_PAGE;
-    buf[1] = (block_size >> 8) & 0xff;
-    buf[2] = block_size & 0xff;
-    buf[3] = memtype;
-    buf[4] = Sync_CRC_EOP;
-    stk500_send(pgm, buf, 5);
+    // Workaround for the infamous ';' bug in the Prusa3D usb to serial converter.
+    // Send the binary data by nibbles to avoid transmitting the ';' character.
+    buf[1] = (block_size >> 8) & 0xf0;
+    buf[2] = (block_size >> 8) & 0x0f;
+    buf[3] = block_size & 0xf0;
+    buf[4] = block_size & 0x0f;
+    buf[5] = memtype;
+    buf[6] = Sync_CRC_EOP;
+    stk500_send(pgm, buf, 7);
 
     if (stk500_recv(pgm, buf, 1) < 0)
       return -1;
@@ -1055,8 +1088,8 @@ static int stk500_set_sck_period(PROGRAMMER * pgm, double v)
 
   min = 8.0 / STK500_XTAL;
   max = 255 * min;
-  dur = v / min + 0.5;
-  
+  dur = (int)(v / min + 0.5);
+
   if (v < min) {
       dur = 1;
       avrdude_message(MSG_INFO, "%s: stk500_set_sck_period(): p = %.1f us too small, using %.1f us\n",
@@ -1066,7 +1099,7 @@ static int stk500_set_sck_period(PROGRAMMER * pgm, double v)
       avrdude_message(MSG_INFO, "%s: stk500_set_sck_period(): p = %.1f us too large, using %.1f us\n",
                       progname, v / 1e-6, dur * min / 1e-6);
   }
-  
+
   return stk500_setparm(pgm, Parm_STK_SCK_DURATION, dur);
 }
 
